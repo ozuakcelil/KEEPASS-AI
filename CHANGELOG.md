@@ -60,6 +60,16 @@ Security review before the first public release.
 - A failed venv creation is cleaned up and a hint is shown.
 - `vault.ps1` sets UTF-8 output. `vault.sh` is safe with `CDPATH`.
 
+### Other assistants
+- The gate and the rules work with any assistant that runs shell commands. The docs now
+  cover Codex CLI, Gemini CLI, Cursor and Copilot as well as Claude Code.
+- The guard understands other tool shapes: Gemini-style names and fields (`run_shell_command`,
+  `read_file`, `absolute_path`, ...), Codex `apply_patch` patches, list-valued paths and flat
+  `{"command": ...}` events.
+- `guard.py --format exit2`: prints the reason on stderr and exits with code 2, the common
+  hook convention.
+- The settings and hook files of Gemini CLI, Codex CLI and Cursor are protected too.
+
 ### Project
 - Python 3.10 or newer is required (3.9 is out of support).
 - On macOS and Linux, a backslash in a PowerShell command is treated as a path separator.

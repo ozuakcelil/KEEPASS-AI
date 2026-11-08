@@ -7,7 +7,8 @@ At the end you will have:
 - a KeePass vault (`.kdbx`) that opens with a **key file** (no typed password);
 - a working folder `~/.keepassai/` with a private Python venv, the config and backups;
 - the gate (`vault.ps1` / `vault.sh`) that the assistant uses;
-- the guard hook in Claude Code, which blocks every other way to the vault.
+- the guard hook (automatic for Claude Code, manual for other assistants), which blocks
+  every other way to the vault.
 
 ---
 
@@ -153,7 +154,12 @@ refuses to write until you lock or close the vault there.
 On Windows, if PowerShell refuses to run `.ps1` files, allow local scripts once:
 `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`.
 
-## Step 7. Enable the guard hook in Claude Code
+## Step 7. Enable the guard
+
+The guard checks every tool call before it runs. How you hook it in depends on your
+assistant.
+
+### Claude Code (automatic)
 
 Run the installer once more with `--hook`:
 
@@ -190,30 +196,66 @@ your machine:
 - `onFailure: block` also blocks the call if the guard process cannot start or times out.
   This needs a Claude Code version that supports `onFailure`; older versions let the call
   through in that case.
-
-**Claude Code versions without the `args` field:** use a single command string instead, for
-example
-`"command": "\"/home/you/.keepassai/venv/bin/python\" -I \"/home/you/tools/KEEPASS-AI/guard.py\""`.
+- Claude Code versions without the `args` field: use a single command string instead, for
+  example
+  `"command": "\"/home/you/.keepassai/venv/bin/python\" -I \"/home/you/tools/KEEPASS-AI/guard.py\""`.
 
 Restart Claude Code, or start a new session, so the hook is loaded.
+
+### Other assistants (manual)
+
+If your assistant can run a command before each tool call (a "pre-tool" or "before shell
+execution" hook), point that hook at the guard with the generic output format:
+
+```
+<venv python> -I <path>/guard.py --format exit2
+```
+
+`<venv python>` is `~/.keepassai/venv/bin/python`, or
+`%USERPROFILE%\.keepassai\venv\Scripts\python.exe` on Windows.
+
+- **Input:** the guard reads the tool call as JSON on stdin. It accepts
+  `{"tool_name": ..., "tool_input": {...}, "cwd": ...}` (Claude Code, Gemini CLI and
+  similar), or a flat event such as `{"command": "...", "cwd": "..."}` or
+  `{"file_path": "..."}`.
+- **Tool names:** it understands the common ones (`Bash`, `run_shell_command`, `Read`,
+  `read_file`, `write_file`, `replace`, `apply_patch`, and so on).
+- **Output:** on deny it prints the reason on stderr and exits with code `2`; on allow it
+  prints nothing and exits `0`.
+
+Check your tool's hook documentation for where to put the command and whether it expects a
+different output. Only the Claude Code setup is tested end to end.
+
+If your assistant has no hooks, turn on its approval step for every shell command. The gate
+still never prints secrets, but nothing then stops the assistant from reading the key file
+by other means.
 
 ## Step 8. Tell the assistant how to use it
 
 Open [AI-INSTRUCTIONS.md](AI-INSTRUCTIONS.md) and replace `<GATE>` with the absolute path of
-this folder. Paste it into `~/.claude/CLAUDE.md` (applies to every project) or into the
-project's `CLAUDE.md`.
+this folder. Paste it into your assistant's instruction file:
+
+| Assistant | File |
+|---|---|
+| Claude Code | `~/.claude/CLAUDE.md` (every project) or the project's `CLAUDE.md` |
+| Codex CLI and other `AGENTS.md` readers | `~/.codex/AGENTS.md` or the project's `AGENTS.md` |
+| Gemini CLI | `~/.gemini/GEMINI.md` or the project's `GEMINI.md` |
+| Cursor | a rule file in `.cursor/rules/` |
+| GitHub Copilot | `.github/copilot-instructions.md` |
 
 ## Step 9. Check that the guard works
 
-Ask the assistant to do each of these. All must be **denied** with a "KeePassAI guard"
-reason:
+Ask the assistant to do each of these. With the guard enabled, all must be **denied** with a
+"KeePassAI guard" reason:
 
 1. "Show the contents of my key file." (also try "search my whole home folder for the word
    `KeyFile`")
 2. "Read `~/.keepassai/config.json`."
-3. "Add a line to `~/.claude/settings.json`."
+3. "Add a line to your own settings file." (for example `~/.claude/settings.json` or
+   `~/.gemini/settings.json`)
 4. "Edit `guard.py` in the KeePassAI folder." (also via `cd` into the folder and `sed -i`)
-5. "Run `pipe <entry> python -c 'print(input())'`." (the gate refuses it)
+5. "Run `pipe <entry> python -c 'print(input())'`." (the gate itself refuses this one, with
+   or without the guard)
 
 These must **work**:
 - "Run the vault gate's `list` command."
@@ -226,17 +268,19 @@ Denials are logged in `~/.keepassai/guard.log`, and gate calls in `~/.keepassai/
 
 1. You, not the assistant (the folder is read-only for it), run `git pull` in the folder,
    or replace its files.
-2. Run `install.py` again (with `--hook` if the folder moved) to update the venv and the
-   hook path.
-3. Start a new Claude Code session.
+2. Run `install.py` again (with `--hook` if the folder moved and you use Claude Code) to
+   update the venv and the hook path. For other assistants, update the path in their hook
+   yourself.
+3. Start a new assistant session.
 
 Your `config.json` is kept. New settings (`pipe_allow`, `keep_backups`, `pipe_timeout`) are
 optional and have defaults.
 
 ## Uninstalling
 
-1. Remove the KeePassAI entry from `hooks.PreToolUse` in `~/.claude/settings.json`, or
-   restore the `settings.json.bak-*` file the installer made.
+1. Remove the KeePassAI hook from your assistant's settings. For Claude Code that is the
+   entry in `hooks.PreToolUse` in `~/.claude/settings.json`; you can also restore the
+   `settings.json.bak-*` file the installer made.
 2. Delete `~/.keepassai/`. This removes the venv, the logs and the vault backups; keep the
    backups if you want them.
 3. Delete this folder. Your vault and your key file are not touched.

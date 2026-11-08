@@ -179,9 +179,12 @@ def main():
         step("adding the guard hook to Claude Code")
         add_hook(pathlib.Path(a.settings).expanduser(), py, custom_home)
     else:
-        step("hook NOT added (run again with --hook). Settings snippet:")
+        step("Claude Code hook NOT added (run again with --hook). Settings snippet:")
         print(json.dumps({"hooks": {"PreToolUse": [{"hooks": [hook_entry(py, custom_home)]}]}},
                          indent=2, ensure_ascii=False))
+        extra = f' --home "{custom_home}"' if custom_home else ""
+        step("other assistants: run this from their pre-tool hook (INSTALL.md, step 7):")
+        print(f'    "{py}" -I "{GUARD}" --format exit2{extra}')
 
     if custom_home:
         print(f"    NOTE: custom working folder. Set KEEPASSAI_HOME={custom_home} permanently in your "

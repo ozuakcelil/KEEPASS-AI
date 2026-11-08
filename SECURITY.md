@@ -11,7 +11,7 @@ consent, **privately** through GitHub: open the repository's **Security** tab an
 **Report a vulnerability**. Do not open a public issue for it.
 
 Include the tool call (or the command) that gets through, your OS and shell, and the
-Claude Code version. Never include real secrets, vault files or key files.
+assistant and its version. Never include real secrets, vault files or key files.
 
 Known limitations that the README already lists (code that builds paths at run time,
 transformations by a remote program, other AI tools) are not treated as vulnerabilities.

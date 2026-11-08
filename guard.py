@@ -1,12 +1,18 @@
-"""KeePassAI guard - a Claude Code PreToolUse hook.
+"""KeePassAI guard - a pre-tool-call hook for AI coding assistants.
 
-Reads the tool call JSON on stdin and prints a "deny" decision when the call would
+Reads one tool call as JSON on stdin and denies it when the call would
   * read or write the secret files: the key file, the vault file, the working folder
     (venv, config, backups; only gate.log / guard.log may be read), or
-  * modify protected files: the gate folder, Claude Code settings files and hooks, shell
-    profiles, Python start-up files, or
+  * modify protected files: the gate folder, the assistants' settings and hook files
+    (Claude Code, Gemini CLI, Codex CLI, Cursor), shell profiles, Python start-up files, or
   * use KeePass tooling or obfuscation tricks in a shell command,
 unless the call is the gate itself (vault.ps1 / vault.sh). Everything else is allowed silently.
+
+Input: {"tool_name": ..., "tool_input": {...}, "cwd": ...} (Claude Code, Gemini CLI and
+similar), or a flat {"command": ..., "cwd": ...} / {"file_path": ...} event.
+Output (--format):
+  claude (default) a Claude Code PreToolUse JSON decision on stdout, exit 0
+  exit2            the reason on stderr and exit code 2 on deny (the common hook convention)
 
 Decisions are made on resolved paths (symlinks, junctions, hard links, 8.3 names, \\\\?\\ paths,
 Git Bash /c/ paths, ~ and home variables, wildcards, brace expansion, escapes, relative paths
@@ -28,8 +34,17 @@ import unicodedata
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))  # needed under python -I
 import common  # noqa: E402
 
-WRITE_TOOLS = {"Write", "Edit", "MultiEdit", "NotebookEdit"}
-PATH_FIELDS = ("file_path", "notebook_path", "path")
+# Tool names differ per assistant: a tool counts as writing if its name says so.
+WRITE_TOOLS = {"write", "edit", "multiedit", "notebookedit", "write_file", "replace", "apply_patch",
+               "edit_file", "create_file", "delete_file", "str_replace", "insert"}
+WRITE_HINT = re.compile(r"write|edit|replace|patch|create|delete|insert|move|rename|append", re.I)
+SEARCH_HINT = re.compile(r"grep|search", re.I)
+PATH_FIELDS = ("file_path", "notebook_path", "path", "absolute_path", "target_file", "filename", "file",
+               "dir_path", "directory", "source", "destination", "target")
+PATCH_FILE = re.compile(r"^\*\*\* (?:Add|Update|Delete) File: (.+?)\s*$|^\*\*\* Move to: (.+?)\s*$", re.M)
+# Folders of assistants whose settings or hook files must not be changed by the assistant.
+AGENT_DIRS = (".claude", ".gemini", ".codex", ".cursor")
+AGENT_CONFIG = re.compile(r"^(settings[\w.-]*\.json|config\.toml|hooks\.json|mcp\.json)$")
 LOG_NAMES = {"gate.log", "guard.log", "guard.log.1", "gate.log.1"}
 LOG_LIMIT = 1_000_000
 
@@ -66,8 +81,8 @@ SHELL_PREFIX = {"bash", "sh", "zsh", "pwsh", "pwsh.exe", "powershell", "powershe
 
 IS_WIN = os.name == "nt"
 OFF_LIMITS = "the key file, the vault file and the gate's working folder are off limits"
-READ_ONLY = "the gate, its logs, Claude settings, shell profiles and Python start-up files are read-only " \
-            "for the assistant"
+READ_ONLY = "the gate, its logs, assistant settings and hooks, shell profiles and Python start-up files " \
+            "are read-only for the assistant"
 NARROW = "bulk read, copy or search of a folder that contains the key file; give a narrower path"
 
 
@@ -171,9 +186,14 @@ class Rules:
         self.db = real(self.cfg["db"]) if self.cfg["db"] else None
         self.ids = {i for i in (file_id(self.cfg["key"]) if self.key else None,
                                 file_id(self.cfg["db"]) if self.db else None) if i}
-        claude = pathlib.Path(os.environ.get("CLAUDE_CONFIG_DIR") or (home / ".claude"))
-        self.protected = [self.gate, real(claude / "hooks"), real(claude / "settings.json"),
-                          real(claude / "settings.local.json")]
+        self.protected = [self.gate]
+        agent_homes = [home / d for d in AGENT_DIRS]
+        for var in ("CLAUDE_CONFIG_DIR", "CODEX_HOME", "GEMINI_CONFIG_DIR"):
+            if os.environ.get(var):
+                agent_homes.append(pathlib.Path(os.environ[var]))
+        for d in agent_homes:
+            self.protected += [real(d / "hooks"), real(d / "settings.json"), real(d / "settings.local.json"),
+                               real(d / "config.toml"), real(d / "hooks.json")]
         for name in (".bashrc", ".bash_profile", ".bash_login", ".profile", ".zshrc", ".zprofile", ".zshenv",
                      ".zlogin", ".config/fish", ".config/powershell", "Documents/PowerShell",
                      "Documents/WindowsPowerShell"):
@@ -203,8 +223,9 @@ class Rules:
         if self.is_log(p) or any(inside(p, r) for r in self.protected):
             return True
         parts = p.split("/")
-        if len(parts) >= 2 and parts[-2] == ".claude" and parts[-1].startswith("settings") \
-                and parts[-1].endswith(".json"):
+        if len(parts) >= 2 and parts[-2] in AGENT_DIRS and AGENT_CONFIG.match(parts[-1]):
+            return True          # project-level settings/hook files of any assistant
+        if len(parts) >= 3 and parts[-3] in AGENT_DIRS and parts[-2] == "hooks":
             return True
         return bool(STARTUP_FILES.search(p))
 
@@ -417,26 +438,43 @@ def check_shell(cmd: str, rules: Rules, cwd: str, tool: str):
 
 # ---------------------------------------------------------------- other tools
 
-def check_paths(tool: str, tin: dict, rules: Rules, cwd: str):
-    for field in PATH_FIELDS:
+def tool_paths(tin: dict):
+    """Paths named by a tool input: the usual path fields, list fields such as "paths", and the
+    file headers of an apply_patch style patch."""
+    out = []
+    for field in PATH_FIELDS + ("paths", "files", "file_paths"):
         val = tin.get(field)
-        if not isinstance(val, str) or not val:
-            continue
+        if isinstance(val, str) and val:
+            out.append(val)
+        elif isinstance(val, list):
+            out += [v for v in val if isinstance(v, str) and v]
+    for val in tin.values():
+        if isinstance(val, str) and "*** " in val:
+            out += [a or b for a, b in PATCH_FILE.findall(val)]
+    return out
+
+
+def check_paths(tool: str, tin: dict, rules: Rules, cwd: str):
+    name = tool.casefold().rsplit("__", 1)[-1]          # mcp__server__tool -> tool
+    writes = name in WRITE_TOOLS or bool(WRITE_HINT.search(name))
+    searches = bool(SEARCH_HINT.search(name))
+    paths = tool_paths(tin)
+    for val in paths:
         found = candidates(val, cwd)
         if not found:
             continue
         p = found[0]
         if rules.secret(p):
             raise Denied(OFF_LIMITS)
-        if tool in WRITE_TOOLS and (rules.write_protected(p) or inside(p, rules.stdlib)):
+        if writes and (rules.write_protected(p) or inside(p, rules.stdlib)):
             raise Denied(READ_ONLY)
-        if tool == "Grep" and rules.key_ancestor(p):
+        if searches and rules.key_ancestor(p):
             raise Denied(NARROW)
-    if tool == "Grep" and not isinstance(tin.get("path"), str) and rules.key_ancestor(real(cwd or os.getcwd())):
+    if searches and not paths and rules.key_ancestor(real(cwd or os.getcwd())):
         raise Denied(NARROW)
 
-    if tool in WRITE_TOOLS:
-        path = str(tin.get("file_path") or tin.get("notebook_path") or "")
+    if writes:
+        path = str(tin.get("file_path") or tin.get("notebook_path") or tin.get("path") or "")
         if path.casefold().endswith(SCRIPT_EXT):
             body = fold(json.dumps({k: v for k, v in tin.items() if k not in PATH_FIELDS}, ensure_ascii=False))
             hit = next((w for w in rules.text_deny if w and w in body), None)
@@ -467,7 +505,9 @@ def decide(data: dict, home_arg=None):
     tool = str(data.get("tool_name") or "")
     tin = data.get("tool_input")
     if not isinstance(tin, dict):
-        tin = {}
+        # flat events (for example a "before shell execution" hook): the event is the input
+        tin = {k: v for k, v in data.items() if k != "cwd"} if not tool else {}
+        tool = tool or ("Shell" if isinstance(data.get("command"), str) else "Read")
     cwd = str(data.get("cwd") or "")
     try:
         rules = Rules(home_arg)
@@ -482,6 +522,7 @@ def decide(data: dict, home_arg=None):
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
     home_arg = argv[argv.index("--home") + 1] if "--home" in argv[:-1] else None
+    fmt = argv[argv.index("--format") + 1] if "--format" in argv[:-1] else "claude"
     tool = "?"
     try:
         raw = sys.stdin.buffer.read().decode("utf-8-sig", "replace")
@@ -495,11 +536,15 @@ def main(argv=None):
     if reason is None:
         return 0
     log_denial(tool, reason)
+    message = (f"KeePassAI guard: {reason}. Use the vault gate (vault.ps1 / vault.sh) or ask the user; "
+               f"see {common.GATE_DIR / 'README.md'}")
+    if fmt == "exit2":
+        print(message, file=sys.stderr)
+        return 2
     print(json.dumps({"hookSpecificOutput": {
         "hookEventName": "PreToolUse",
         "permissionDecision": "deny",
-        "permissionDecisionReason": f"KeePassAI guard: {reason}. Use the vault gate (vault.ps1 / vault.sh) "
-                                    f"or ask the user; see {common.GATE_DIR / 'README.md'}",
+        "permissionDecisionReason": message,
     }}))
     return 0
 

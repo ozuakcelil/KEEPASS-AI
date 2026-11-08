@@ -1,12 +1,25 @@
 # KeePassAI
 
-Let an AI coding assistant (Claude Code) **use** the secrets in your KeePass vault
-(generate them, store them, feed them to commands) **without seeing them**.
+Let an AI coding assistant **use** the secrets in your KeePass vault (generate them, store
+them, feed them to commands) **without seeing them**.
+
+**Which assistants it works with:**
+- **The gate** is a plain command-line tool, so any assistant that can run shell commands can
+  use it: Claude Code, OpenAI Codex CLI, Gemini CLI, Cursor, GitHub Copilot agent mode, Aider
+  and others. Put the rules from [AI-INSTRUCTIONS.md](AI-INSTRUCTIONS.md) into that tool's
+  instruction file (`CLAUDE.md`, `AGENTS.md`, `GEMINI.md`, `.cursor/rules`, ...).
+- **The guard**, which blocks every other way to the vault, is a pre-tool-call hook. The
+  installer sets it up automatically for Claude Code. Any assistant that can run a command
+  before each tool call can use it too, with `guard.py --format exit2`. It understands the
+  common tool shapes (`Bash`, `run_shell_command`, `read_file`, `write_file`, `apply_patch`,
+  ...). See [Using it with other assistants](#using-it-with-other-assistants). Without a
+  hook, you get the gate and the rules, but no enforcement.
 
 Works on Windows, macOS and Linux. It uses the standard KeePass `.kdbx` format, so you keep
 using KeePassXC (or any KeePass app) as usual.
 
-> Status: early (0.2). Tested on Windows; macOS and Linux are covered by CI tests only.
+> Status: early (0.2). Used day to day with Claude Code on Windows; macOS, Linux and the
+> other assistants' tool shapes are covered by CI tests only.
 > Read the [security model](#security-model-what-this-does-and-does-not-protect) before you rely on it.
 
 ## The problem
@@ -22,7 +35,7 @@ prints ends up in the chat transcript, in logs and in the model's context.
       │                  (the gate)          │
       │                                      └─ secrets go only to a program's stdin/env,
       │                                         and are masked in that program's output
-      └─ every tool call ──► guard.py (Claude Code hook) ──► blocks every other way in
+      └─ every tool call ──► guard.py (pre-tool hook) ──► blocks every other way in
 ```
 
 1. **The gate** (`vault.py`, run through `vault.ps1` on Windows or `vault.sh` on macOS/Linux)
@@ -32,15 +45,16 @@ prints ends up in the chat transcript, in logs and in the model's context.
    common encodings of them (reversed, base64, base32, hex, URL and JSON escaped), are
    replaced with `<hidden>` in the program's output. Every call is logged without secrets to
    `~/.keepassai/gate.log`.
-2. **The guard** (`guard.py`) is a Claude Code `PreToolUse` hook that runs before every tool
-   call. It works on **resolved paths**: it expands `~` and home variables, Git Bash `/c/`
+2. **The guard** (`guard.py`) is a hook that runs before every tool call. It is installed
+   automatically for Claude Code (`PreToolUse`) and can be wired into other assistants by
+   hand. It works on **resolved paths**: it expands `~` and home variables, Git Bash `/c/`
    paths, wildcards and paths relative to `cd`, and it follows symlinks, junctions and 8.3
    names. It then decides whether a path is inside a protected place:
    - **off limits** (no reading, no writing): the key file, the vault file and the working
      folder `~/.keepassai` (only `gate.log` and `guard.log` may be read);
-   - **read-only**: the gate folder, the Claude Code settings files and hooks
-     (`~/.claude/settings*.json`, `.claude/settings*.json` in any project, `~/.claude/hooks`),
-     shell profiles, Python start-up files (`sitecustomize.py`, `*.pth`) and the standard
+   - **read-only**: the gate folder; the settings and hook files of Claude Code, Gemini CLI,
+     Codex CLI and Cursor (`settings*.json`, `config.toml`, `hooks.json`, `hooks/`, in the
+     home folder and in any project); shell profiles; Python start-up files (`sitecustomize.py`, `*.pth`) and the standard
      library the guard runs on.
 
    It also blocks recursive searches or copies of a folder that contains the key file, the
@@ -131,8 +145,25 @@ git clone https://github.com/ozuakcelil/KEEPASS-AI.git ~/tools/KEEPASS-AI
 python3 ~/tools/KEEPASS-AI/install.py --db ~/Vault/home.kdbx --key ~/.keys/home.keyx --hook
 ```
 
-Then restart Claude Code, and put the contents of [AI-INSTRUCTIONS.md](AI-INSTRUCTIONS.md)
-into your `CLAUDE.md` so the assistant knows how to use the gate.
+`--hook` sets up the guard for Claude Code; leave it out for other assistants and see
+[Using it with other assistants](#using-it-with-other-assistants). Then restart the
+assistant, and put the contents of [AI-INSTRUCTIONS.md](AI-INSTRUCTIONS.md) into its
+instruction file (`CLAUDE.md`, `AGENTS.md`, `GEMINI.md`, ...) so it knows how to use the gate.
+
+## Using it with other assistants
+
+1. Install as described in INSTALL.md, but skip `--hook` if you do not use Claude Code.
+2. Copy the rules from [AI-INSTRUCTIONS.md](AI-INSTRUCTIONS.md) into the assistant's
+   instruction file, for example `AGENTS.md` (Codex CLI and others), `GEMINI.md` (Gemini
+   CLI), `.cursor/rules/` (Cursor) or `.github/copilot-instructions.md` (Copilot).
+3. Without the guard, those rules are a request, not a barrier. If your tool has a
+   pre-execution hook or an approval policy, use it:
+   - call `guard.py --format exit2` from that hook (INSTALL.md, step 7). It reads the tool
+     call as JSON on stdin; when it denies, it exits with code 2 and prints the reason on
+     stderr;
+   - or at least require your approval for every shell command.
+4. The other protections live in the gate itself and work with every assistant: masked
+   output, the `pipe_allow` list, backups, locking and no hard delete.
 
 ## Files
 
@@ -140,11 +171,11 @@ into your `CLAUDE.md` so the assistant knows how to use the gate.
 |---|---|
 | `vault.py` | The gate (needs the `pykeepass` library) |
 | `vault.ps1`, `vault.sh` | Wrappers that run the gate with its private venv |
-| `guard.py` | Claude Code `PreToolUse` hook (standard library only) |
+| `guard.py` | Pre-tool-call hook: Claude Code format by default, `--format exit2` for other tools (standard library only) |
 | `common.py` | Shared config loading |
 | `install.py` | Creates the venv, the config and (optionally) the hook |
 | `config.example.json` | Config template |
-| `AI-INSTRUCTIONS.md` | Rules to paste into `CLAUDE.md` or your assistant's memory |
+| `AI-INSTRUCTIONS.md` | Rules to paste into your assistant's instruction file (`CLAUDE.md`, `AGENTS.md`, ...) |
 | `tests/` | pytest suite; it uses a throwaway vault in a temp folder |
 
 Working folder (not in the repo): `~/.keepassai/` holds `venv/`, `config.json`, `backups/`,
@@ -187,12 +218,14 @@ Working folder (not in the repo): `~/.keepassai/` holds `venv/`, `config.json`, 
   running the assistant as a different user that cannot read the key file.
 - protect secrets after they leave the gate. If `pipe` sends a password to a server, the
   server has it.
-- cover other AI tools. The guard is a Claude Code hook; other agents need their own
-  equivalent.
+- enforce anything for an assistant that has no hook pointing at the guard. The gate works
+  with any assistant; enforcement needs the hook (set up automatically for Claude Code, by
+  hand for others), or at least an approval step for shell commands.
 - remove old secrets. Backups and the Recycle Bin keep previous values until you delete them
   yourself.
-- block crashes on old Claude Code versions. `onFailure: block` needs a Claude Code version
-  that supports it; on older versions a guard that crashes or times out lets the call through.
+- block the call when the guard cannot start or times out, unless the assistant supports
+  that. Claude Code does, with `onFailure: block` in recent versions; check your tool's hook
+  docs.
 
 **Keep truly personal secrets elsewhere.** Use this vault only for the machine and service
 credentials the assistant manages. Put bank, email and other personal passwords in a second
@@ -208,8 +241,8 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt pytest
 ```
 
 The guard protects the folder it is installed from. Work on a **separate clone**, not on
-the copy your hook points at. The source mentions KeePass file and library names, so a
-Claude Code session with the guard enabled cannot edit `.py` files that use them.
+the copy your hook points at. The source mentions KeePass file and library names, so an
+assistant session with the guard enabled cannot edit `.py` files that use them.
 
 ## License
 

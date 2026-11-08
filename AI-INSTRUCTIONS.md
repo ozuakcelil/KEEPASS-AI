@@ -1,7 +1,13 @@
 # Vault rules for the AI assistant
 
-Paste this section into your `CLAUDE.md` (or your assistant's memory) and replace `<GATE>`
-with the absolute path of this folder.
+Paste this section into your assistant's instruction file and replace `<GATE>` with the
+absolute path of this folder. That file is `CLAUDE.md` for Claude Code, `AGENTS.md` for Codex
+CLI and others, `GEMINI.md` for Gemini CLI, `.cursor/rules/` for Cursor, and
+`.github/copilot-instructions.md` for Copilot.
+
+The guard hook mentioned below is installed automatically for Claude Code; other tools need
+it set up by hand (INSTALL.md, step 7). Without it these rules are not enforced, so turn on
+your tool's approval step for shell commands.
 
 ---
 
@@ -15,7 +21,7 @@ with the absolute path of this folder.
   `~/.keepassai/` except `gate.log` and `guard.log`. Never call KeePass tools or libraries
   directly. A guard hook enforces this. If it denies a call, do not try to get around it: use
   the gate or ask the user.
-- Never edit the gate folder, `~/.keepassai/`, Claude Code settings files or shell profiles.
+- Never edit the gate folder, `~/.keepassai/`, your own settings or hook files, or shell profiles.
   Those belong to the user.
 - To create a secret:
   - a password: `add "<Group>/<title>" --user U --url URL`;

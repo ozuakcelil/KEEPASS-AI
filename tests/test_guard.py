@@ -216,3 +216,37 @@ def test_review_false_positives(sandbox):
     assert run(sb, "Write", file_path=str(sb["project"] / "lib" / "site-packages" / "evil.pth"), content="x")
     assert bash(sb, "eval $(echo x)")
     assert bash(sb, "pwsh -ec ZQBjAGgAbwA=")
+
+
+def test_other_assistants_tool_shapes(sandbox):
+    sb = sandbox
+    key = str(sb["key"])
+    # Gemini CLI style tool names and fields
+    assert run(sb, "read_file", absolute_path=key)
+    assert run(sb, "run_shell_command", command="cat ~/.keepassai/config.json")
+    assert run(sb, "search_file_content", pattern="x", path=str(sb["home"]))
+    assert run(sb, "write_file", file_path=str(sb["home"] / ".gemini" / "settings.json"), content="{}")
+    assert run(sb, "write_file", file_path=str(sb["project"] / "notes.txt"), content="ok") is None
+    # Codex CLI style patch
+    patch = f"*** Begin Patch\n*** Update File: {GATE}/guard.py\n@@\n-a\n+b\n*** End Patch"
+    assert run(sb, "apply_patch", input=patch)
+    ok = f"*** Begin Patch\n*** Add File: {sb['project']}/x.txt\n+hi\n*** End Patch"
+    assert run(sb, "apply_patch", input=ok) is None
+    # settings and hook files of other assistants
+    assert run(sb, "Write", file_path=str(sb["home"] / ".codex" / "config.toml"), content="")
+    assert run(sb, "Write", file_path=str(sb["project"] / ".cursor" / "hooks.json"), content="{}")
+    assert run(sb, "Write", file_path=str(sb["project"] / ".gemini" / "settings.json"), content="{}")
+    # list-valued paths
+    assert run(sb, "read_many_files", paths=[str(sb["project"] / "a"), key])
+
+
+def test_flat_events_and_exit2_format(sandbox, monkeypatch, capsys):
+    sb = sandbox
+    assert guard.decide({"command": "cat ~/.vaultkey/lab.keyx", "cwd": str(sb["project"])})
+    assert guard.decide({"file_path": str(sb["key"])})
+    assert guard.decide({"command": "ls", "cwd": str(sb["project"])}) is None
+    payload = {"tool_name": "Read", "tool_input": {"file_path": str(sb["key"])}}
+    monkeypatch.setattr(sys, "stdin", io.TextIOWrapper(io.BytesIO(json.dumps(payload).encode())))
+    assert guard.main(["--format", "exit2"]) == 2
+    out = capsys.readouterr()
+    assert out.out == "" and "KeePassAI guard" in out.err
