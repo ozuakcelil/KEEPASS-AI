@@ -224,7 +224,10 @@ def lex(cmd: str, posix: bool):
 
     def end_tok():
         if tok:
-            cur.append("".join(tok))
+            t = "".join(tok)
+            if not posix and not IS_WIN:
+                t = t.replace("\\", "/")    # PowerShell on macOS/Linux accepts \ as a path separator
+            cur.append(t)
             tok.clear()
 
     def end_seg(next_sep):

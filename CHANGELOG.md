@@ -61,6 +61,8 @@ Security review before the first public release.
 - `vault.ps1` sets UTF-8 output. `vault.sh` is safe with `CDPATH`.
 
 ### Project
+- Python 3.10 or newer is required (3.9 is out of support).
+- On macOS and Linux, a backslash in a PowerShell command is treated as a path separator.
 - Added a pytest suite, GitHub Actions CI (Windows, macOS, Linux), MIT license, SECURITY.md
   and `.gitattributes`.
 

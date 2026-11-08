@@ -1,4 +1,4 @@
-"""KeePassAI installer (Windows, macOS, Linux). Run it with any Python 3.9+:
+"""KeePassAI installer (Windows, macOS, Linux). Run it with any Python 3.10+:
 
     python install.py --db <vault file> --key <key file> [--hook] [--home DIR] [--settings FILE]
 
@@ -123,8 +123,8 @@ def main():
     ap.add_argument("--skip-test", action="store_true", help="do not open the vault as a self-test")
     a = ap.parse_args()
 
-    if sys.version_info < (3, 9):
-        fail("Python 3.9 or newer is required")
+    if sys.version_info < (3, 10):
+        fail("Python 3.10 or newer is required")
     custom_home = None
     if a.home:
         custom_home = pathlib.Path(a.home).expanduser().resolve()

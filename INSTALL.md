@@ -24,7 +24,7 @@ You only need it to look at and edit the vault yourself.
 
 Or download it from https://keepassxc.org/download/.
 
-## Step 2. Install Python 3.9 or newer, and git
+## Step 2. Install Python 3.10 or newer, and git
 
 Check first: `py -3 --version` (Windows) or `python3 --version` (macOS/Linux).
 
