@@ -1,0 +1,8 @@
+{
+  "db": "~/Vault/home.kdbx",
+  "key": "~/.keys/home.keyx",
+  "pipe_allow": ["ssh"],
+  "keep_backups": 50,
+  "pipe_timeout": 300,
+  "deny": []
+}
