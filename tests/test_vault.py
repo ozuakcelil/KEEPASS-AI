@@ -78,7 +78,8 @@ def test_backups_are_rotated(sb, capsys):
 
 
 def test_gui_running_blocks_writes(sb, capsys, monkeypatch):
-    monkeypatch.setattr(vault, "gui_running", lambda: True)
+    monkeypatch.setattr(vault, "gui_running", lambda: {"keepassxc"})
+    write_config(sb, allow_open_app=False)
     assert gate(capsys, "add", "svc")[0] == vault.GATE_ERROR
     assert gate(capsys, "add", "svc", "--force-gui")[0] == 0
 
@@ -168,3 +169,61 @@ def test_missing_config_and_bad_timeout(sb, capsys):
 def test_duplicate_with_messy_group(sb, capsys):
     assert gate(capsys, "add", "T", "--group", "A//B")[0] == 0
     assert gate(capsys, "add", "A/B/T")[0] == vault.GATE_ERROR
+
+
+def test_allow_open_app_lets_writes_proceed(sb, capsys, monkeypatch):
+    monkeypatch.setattr(vault, "gui_running", lambda: {"keepassxc"})
+    rc, out, _ = gate(capsys, "add", "svc")                         # default: allowed while an app is open
+    assert rc == 0 and "vault backup:" in out                     # still backed up, locked and saved atomically
+    assert len(list((sb["work"] / "backups").glob("*-after*"))) == 1
+    write_config(sb, allow_open_app=False)
+    assert gate(capsys, "add", "svc2")[0] == vault.GATE_ERROR
+    write_config(sb, allow_open_app="no")                           # wrong type falls back to the default (true)
+    assert gate(capsys, "add", "svc3")[0] == 0
+
+
+def test_keepass2_open_refuses_even_with_allow_open_app(sb, capsys, monkeypatch):
+    for apps in ({"keepass"}, {"keepass", "keepassxc"}):
+        monkeypatch.setattr(vault, "gui_running", lambda apps=apps: apps)
+        rc, _, err = gate(capsys, "add", "svc")
+        assert rc == vault.GATE_ERROR and "KeePass 2" in err
+    assert gate(capsys, "add", "svc", "--force-gui")[0] == 0
+
+
+def test_gui_running_detects_kinds(monkeypatch):
+    import types
+
+    class R:
+        def __init__(self, out="", returncode=1):
+            self.stdout, self.returncode = out, returncode
+    monkeypatch.setattr(vault, "os", types.SimpleNamespace(name="nt"))
+    for out, want in (('"System","4"\n"KeePass.exe","7"', {"keepass"}), ('"KeePassXC.exe","7"', {"keepassxc"}),
+                      ('"KeePass.exe","7"\n"KeePassXC.exe","8"', {"keepass", "keepassxc"}), ("", set())):
+        monkeypatch.setattr(vault.subprocess, "run", lambda *a, out=out, **k: R(out))
+        assert vault.gui_running() == want
+    monkeypatch.setattr(vault, "os", types.SimpleNamespace(name="posix"))
+    monkeypatch.setattr(vault.subprocess, "run", lambda args, **k: R(returncode=0 if args[2] == "keepassxc" else 1))
+    assert vault.gui_running() == {"keepassxc"}
+
+
+def test_save_aborts_if_vault_changes_during_save(sb, capsys, monkeypatch):
+    import pykeepass
+    gate(capsys, "add", "svc")
+    orig = pykeepass.PyKeePass.save
+
+    def slow_save(self, *a, **k):
+        r = orig(self, *a, **k)
+        sb["db"].write_bytes(sb["db"].read_bytes() + b"x")      # another app saves while we derive keys
+        return r
+    before = sb["db"].read_bytes()
+    monkeypatch.setattr(pykeepass.PyKeePass, "save", slow_save)
+    rc, _, err = gate(capsys, "rotate", "svc")
+    assert rc == vault.GATE_ERROR and "changed on disk" in err
+    assert sb["db"].read_bytes() == before + b"x"                    # the other app's file was not overwritten
+    assert not list(sb["db"].parent.glob(".*.tmp"))
+
+
+def test_replace_is_preceded_by_a_backup_of_the_current_file(sb, capsys):
+    gate(capsys, "add", "svc")
+    gate(capsys, "rotate", "svc")
+    assert list((sb["work"] / "backups").glob("*-replaced*"))

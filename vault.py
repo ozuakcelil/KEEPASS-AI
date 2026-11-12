@@ -10,17 +10,22 @@ Usage:
   macOS/Linux: /path/to/vault.sh <command> ...
 Run "<wrapper> <command> --help" for the options of one command.
 
-Exit codes: 0 ok, 2 bad arguments, 3 gate error; `pipe` returns the program's own exit code.
+Exit codes: 0 ok, 2 bad arguments, 3 gate error; `pipe` and `ssh` return the command's own exit
+code (124 on timeout).
 """
 import argparse
 import base64
 import datetime
+import hashlib
 import io
 import json
+import logging
 import os
 import pathlib
+import re
 import secrets
 import shutil
+import socket
 import string
 import subprocess
 import sys
@@ -49,7 +54,17 @@ ENV_DENY_PREFIX = ("LD_", "DYLD_", "PYTHON", "KEEPASSAI_", "BASH_", "NODE_", "PE
 ENV_DENY = {"PATH", "PATHEXT", "HOME", "USERPROFILE", "COMSPEC", "SHELL", "ENV", "IFS", "TEMP", "TMP", "TMPDIR",
             "SYSTEMROOT", "WINDIR", "APPDATA", "LOCALAPPDATA", "PS1", "PS4", "PROMPT_COMMAND", "GIT_SSH_COMMAND",
             "GIT_ASKPASS", "SSH_ASKPASS", "EDITOR", "VISUAL", "PAGER"}
-GUI_NAMES_WIN = ("KeePassXC.exe", "KeePass.exe")
+# running KeePass apps by kind: only KeePassXC merges a changed file, KeePass 2 may save over it
+GUI_NAMES_WIN = {"keepassxc.exe": "keepassxc", "keepass.exe": "keepass"}
+GUI_PGREP = (("keepassxc", "keepassxc"), ("KeePassXC", "keepassxc"), ("keepass", "keepass"), ("keepass2", "keepass"))
+# Custom fields of a server entry that `ssh` trusts. The writing commands refuse to touch them, so the
+# assistant cannot point a stored credential at a host it controls; the user edits them in the KeePass app.
+RESERVED_FIELDS = ("HOSTNAME", "IP", "PORT", "PASSWORD", "JUMP_HOST", "HOST_KEY")
+SSH_CONNECT_TIMEOUT = 30
+HOST_KEY_RE = re.compile(r"(?:(?P<type>[a-z0-9][a-z0-9@.-]*)\s+)?(?:SHA256:)?(?P<fp>[A-Za-z0-9+/]{43})=?")
+HOST_OK = re.compile(r"[A-Za-z0-9._:%-]+")
+# paramiko 5 refuses the legacy key type name "ssh-rsa" in key_types; an RSA key is negotiated as rsa-sha2-*
+KEY_TYPES_FOR = {"ssh-rsa": ["rsa-sha2-512", "rsa-sha2-256"]}
 
 for _s in (sys.stdout, sys.stderr):
     try:
@@ -153,6 +168,39 @@ def find(kp, title):
     return hits[0]
 
 
+def find_strict(kp, ref):
+    """Resolve a reference stored in a server entry (PASSWORD, JUMP_HOST): the exact full name, or a title
+    that matches exactly one live entry. Never falls back from a full name to a title, never looks in the
+    Recycle Bin, and returns None if the reference is missing or ambiguous."""
+    ents = live_entries(kp)
+    by_name = [e for e in ents if full_name(e) == ref]
+    by_title = [e for e in ents if e.title == ref]
+    if by_name and {e.uuid for e in by_title} - {e.uuid for e in by_name}:
+        return None
+    hits = by_name or by_title
+    return hits[0] if len(hits) == 1 else None
+
+
+def server_refs(srv, name):
+    return [r.strip() for r in server_field(srv, name).split(",") if r.strip()]
+
+
+def referenced_by_server(kp, e):
+    """The title of a server entry whose PASSWORD or JUMP_HOST list could point at entry e, else None.
+    Deliberately loose: an entry counts if its full name or its title equals any listed item, even when
+    that item is ambiguous, so trashing one of two same-titled entries cannot re-point a reference."""
+    names = {full_name(e), e.title}
+    for s in live_entries(kp):
+        for field in ("PASSWORD", "JUMP_HOST"):
+            try:
+                refs = server_refs(s, field)
+            except GateError:
+                continue
+            if names & set(refs):
+                return s.title
+    return None
+
+
 def gen(n, charset="full"):
     if not MIN_LEN <= n <= MAX_LEN:
         die(f"length must be between {MIN_LEN} and {MAX_LEN}")
@@ -181,13 +229,43 @@ def safe_url(url):
     return urllib.parse.urlunsplit((u.scheme, netloc, u.path, query, MASK if u.fragment else ""))
 
 
+EXPIRY_WARN_DAYS = 14
+
+
+def expiry_of(e):
+    """The entry's expiry as an aware datetime, or None if it does not expire."""
+    if not e.expires or e.expiry_time is None:
+        return None
+    t = e.expiry_time
+    return t if t.tzinfo else t.replace(tzinfo=datetime.timezone.utc)
+
+
+def expiry_note(e):
+    """'EXPIRED' / 'expires YYYY-MM-DD' if the entry is expired or expires within 14 days, else ''."""
+    t = expiry_of(e)
+    if t is None:
+        return ""
+    left = t - datetime.datetime.now(datetime.timezone.utc)
+    if left <= datetime.timedelta(0):
+        return "EXPIRED"
+    return f"expires {t.astimezone():%Y-%m-%d}" if left <= datetime.timedelta(days=EXPIRY_WARN_DAYS) else ""
+
+
+def expires_text(e):
+    t = expiry_of(e)
+    if t is None:
+        return "never"
+    return f"{t.astimezone():%Y-%m-%d}" + (" (EXPIRED)" if expiry_note(e) == "EXPIRED" else "")
+
+
 def describe(e):
     props = e.custom_properties or {}
     attrs = ", ".join(f"{k}{' (secret)' if e.is_custom_property_protected(k) else ''}" for k in props) or "-"
     return (f"{e.title}\n  group: {path_of(e) or '(root)'}\n  username: {e.username or '-'}\n"
             f"  url: {safe_url(e.url)}\n  password: {'set' if e.password else 'empty'}\n"
             f"  attributes: {attrs}\n  notes: {str(len(e.notes)) + ' chars' if e.notes else '-'}\n"
-            f"  modified: {e.mtime.astimezone():%Y-%m-%d %H:%M}")
+            f"  modified: {e.mtime.astimezone():%Y-%m-%d %H:%M}\n"
+            f"  expires: {expires_text(e)}")
 
 
 def get_field(e, field):
@@ -235,19 +313,31 @@ def ensure_group(kp, path):
     return g
 
 
+def is_reserved(name):
+    return name.strip().casefold() in {f.casefold() for f in RESERVED_FIELDS}
+
+
+def refuse_reserved(name):
+    if is_reserved(name):
+        die(f"{name.strip()!r} is a reserved server field (HOSTNAME, IP, PORT, PASSWORD, JUMP_HOST, HOST_KEY); the user edits it "
+            f"in the KeePass app")
+
+
 def gui_running():
+    """The set of running KeePass app kinds: 'keepassxc' and/or 'keepass' (KeePass 2). Empty if none."""
+    found = set()
     try:
         if os.name == "nt":
             out = subprocess.run(["tasklist", "/NH", "/FO", "CSV"], capture_output=True, text=True,
                                  errors="replace", timeout=10).stdout.casefold()
-            return any(f'"{n.casefold()}"' in out for n in GUI_NAMES_WIN)
-        for args in (["pgrep", "-x", "-i", "keepassxc"], ["pgrep", "-x", "keepassxc"], ["pgrep", "-x", "KeePassXC"]):
-            r = subprocess.run(args, capture_output=True, timeout=10)
-            if r.returncode == 0:
-                return True
+            found = {kind for exe, kind in GUI_NAMES_WIN.items() if f'"{exe}"' in out}
+        else:
+            for name, kind in GUI_PGREP:
+                if subprocess.run(["pgrep", "-x", name], capture_output=True, timeout=10).returncode == 0:
+                    found.add(kind)
     except Exception:
         pass
-    return False
+    return found
 
 
 # ---------------------------------------------------------------- writing safely
@@ -298,8 +388,9 @@ def backup(ctx, tag):
 
 def save(ctx, kp):
     """Write the vault atomically: build in memory, write a temp file, fsync, rename over."""
+    changed = "the vault changed on disk since it was opened (GUI or another write); nothing was saved, try again"
     if ctx.db.stat().st_mtime_ns != ctx.mtime:
-        die("the vault changed on disk since it was opened (GUI or another write); nothing was saved, try again")
+        die(changed)
     buf = io.BytesIO()
     kp.save(buf)
     tmp = ctx.db.with_name(f".{ctx.db.name}.{os.getpid()}.tmp")
@@ -308,6 +399,12 @@ def save(ctx, kp):
             f.write(buf.getvalue())
             f.flush()
             os.fsync(f.fileno())
+        # saving took a while (key derivation): check again right before replacing, and keep a copy of
+        # whatever is on disk now, so a save by another app in the last instant can still be recovered
+        if ctx.db.stat().st_mtime_ns != ctx.mtime:
+            tmp.unlink()
+            die(changed)
+        backup(ctx, "replaced")
         os.replace(tmp, ctx.db)
     except OSError as e:
         try:
@@ -323,7 +420,8 @@ def cmd_list(ctx, kp, a):
     ents = sorted(live_entries(kp), key=lambda e: (path_of(e), e.title))
     for e in ents:
         props = ",".join((e.custom_properties or {}).keys()) or "-"
-        print(f"{full_name(e)} | user={e.username or '-'} | url={safe_url(e.url)} | attributes={props}")
+        print(f"{full_name(e)} | user={e.username or '-'} | url={safe_url(e.url)} | attributes={props}"
+              + (f" | {expiry_note(e)}" if expiry_note(e) else ""))
     print(f"({len(ents)} entries, Recycle Bin excluded)")
     ctx.log("list")
 
@@ -423,6 +521,238 @@ def cmd_pipe(ctx, kp, a):
     return rc
 
 
+# ---------------------------------------------------------------- ssh
+
+def server_field(e, name):
+    """A custom field of a server entry, found case-insensitively; '' if missing."""
+    hits = [v for k, v in (e.custom_properties or {}).items() if k.strip().casefold() == name.casefold()]
+    if len(hits) > 1:
+        die(f"{e.title!r} has more than one {name} field; the user must fix the entry")
+    return (hits[0] or "").strip() if hits else ""
+
+
+def resolve_server(kp, ref, wanted=None):
+    """Return (server entry, credential entry, names, connect_target, port) for a server reference.
+    PASSWORD lists the credential entries (comma separated); `wanted` picks one of them, else the first."""
+    srv = find(kp, ref)
+    if server_field(srv, "JUMP_HOST"):
+        die(f"{srv.title!r} has a JUMP_HOST field; jump hosts are not supported yet")
+    hostname, ip, port_s = (server_field(srv, f) for f in ("HOSTNAME", "IP", "PORT"))
+    target = ip or hostname
+    if not target:
+        die(f"{srv.title!r} has no HOSTNAME or IP field")
+    for v in (hostname, ip):
+        if v and not HOST_OK.fullmatch(v):
+            die(f"{srv.title!r}: HOSTNAME and IP may only contain letters, digits and . : _ - % "
+                f"(no spaces or commas)")
+    try:
+        port = int(port_s) if port_s else 22
+    except ValueError:
+        port = 0
+    if not 0 < port < 65536:
+        die(f"{srv.title!r} has an invalid PORT field")
+    refs = server_refs(srv, "PASSWORD")
+    if not refs:
+        die(f"{srv.title!r} has no PASSWORD field (it lists the credential entries to log in with)")
+    if wanted is None:
+        cred_ref = refs[0]
+    elif wanted.strip() in refs:
+        cred_ref = wanted.strip()
+    else:
+        die(f"{wanted!r} is not one of the credentials of {srv.title!r}; they are: " + ", ".join(refs))
+    cred = find_strict(kp, cred_ref)
+    if cred is None:
+        die(f"credential of {srv.title!r}: {cred_ref!r} is missing or ambiguous; the user should use its "
+            f"full name Group/Title in the PASSWORD field")
+    if cred.uuid == srv.uuid:
+        die(f"{srv.title!r} names itself as its credential entry")
+    if not cred.username or not cred.password:
+        die(f"credential entry {cred.title!r} needs a username and a password")
+    if len(cred.password) < MIN_PIPE_LEN:
+        die(f"refusing to log in with a password shorter than {MIN_PIPE_LEN} characters (it could not be "
+            f"masked reliably); rotate it first")
+    hk = server_field(srv, "HOST_KEY")
+    expected = parse_host_key(hk, srv.title) if hk else None
+    return srv, cred, (hostname, ip), target, port, expected
+
+
+def parse_host_key(value, title):
+    """HOST_KEY field: 'ssh-ed25519 SHA256:<b64>', 'SHA256:<b64>' or '<b64>'. Returns (type or None, b64)."""
+    m = HOST_KEY_RE.fullmatch(value.strip())
+    if not m:
+        die(f"{title!r}: the HOST_KEY field is malformed; expected 'ssh-ed25519 SHA256:<fingerprint>' as "
+            f"printed by the gate on first use")
+    return m.group("type"), m.group("fp")
+
+
+def fp_of_blob(b64):
+    return base64.b64encode(hashlib.sha256(base64.b64decode(b64)).digest()).decode().rstrip("=")
+
+
+def host_masks(values):
+    out = set()
+    for v in values:
+        if len(v) >= 3:
+            out |= {v, v.lower(), v.upper()}
+    return sorted(out, key=len, reverse=True)
+
+
+def fingerprint(key):
+    return "SHA256:" + base64.b64encode(hashlib.sha256(key.asbytes()).digest()).decode().rstrip("=")
+
+
+def pinned_key(path, hid):
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError):
+        die("cannot read the known_hosts file in the working folder")
+    found = []
+    for ln in lines:
+        parts = ln.split()
+        if parts and parts[0] == hid:
+            if len(parts) != 3:
+                die("the known_hosts file has a malformed line for this host; the user must fix or remove it")
+            found.append((parts[1], parts[2]))
+    if len(found) > 1:
+        die("the known_hosts file has more than one line for this host; the user must fix it")
+    return found[0] if found else None
+
+
+def pin_key(path, hid, ktype, b64):
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        with os.fdopen(fd, "a", encoding="utf-8") as f:
+            f.write(f"{hid} {ktype} {b64}\n")
+    except OSError:
+        die("cannot write the known_hosts file in the working folder; not connecting")
+
+
+def open_transport(ctx, paramiko, title, target, port, expected=None):
+    """TCP connect and key exchange only; the host key is checked before any credential is sent."""
+    hid = f"[{target.lower()}]:{port}"
+    kh = ctx.home / "known_hosts"
+    pin = pinned_key(kh, hid)
+    want_type = expected[0] if expected else None
+    if expected and pin:
+        try:
+            pin_fp = fp_of_blob(pin[1])
+        except ValueError:
+            die("the known_hosts file has a malformed line for this host; the user must fix or remove it")
+        if pin_fp != expected[1] or (want_type and want_type != pin[0]):
+            die(f"HOST_KEY of {title!r} (SHA256:{expected[1]}) and the pinned key in known_hosts "
+                f"({pin[0]} SHA256:{pin_fp}) disagree; refusing to connect. The user must fix one of them")
+    key_type = want_type or (pin[0] if pin else None)
+    sock = socket.create_connection((target, port), timeout=SSH_CONNECT_TIMEOUT)
+    tr = paramiko.Transport(sock)
+    try:
+        if key_type:
+            tr.get_security_options().key_types = KEY_TYPES_FOR.get(key_type, [key_type])   # only that type
+        tr.start_client(timeout=SSH_CONNECT_TIMEOUT)
+        key = tr.get_remote_server_key()
+        ktype, b64 = key.get_name(), key.get_base64()
+        if expected and fingerprint(key) != "SHA256:" + expected[1]:
+            die(f"HOST KEY MISMATCH for {title!r}: expected SHA256:{expected[1]} (HOST_KEY field), presented "
+                f"{ktype} {fingerprint(key)}; refusing to connect and no credential was sent")
+        if expected:
+            pass                                   # verified against the vault; known_hosts is not needed
+        elif pin is None:
+            pin_key(kh, hid, ktype, b64)
+            die(f"first connection to {title!r}: host key {ktype} {fingerprint(key)} is now pinned, but "
+                f"nothing was sent. Verify this fingerprint (on the server, or ask the user), then run the "
+                f"command again. To keep it in the vault, the user can put '{ktype} {fingerprint(key)}' in "
+                f"the HOST_KEY field of the server entry")
+        elif pin != (ktype, b64):
+            die(f"HOST KEY MISMATCH for {title!r} (pinned {pin[0]}, got {ktype} {fingerprint(key)}); refusing "
+                f"to connect and no credential was sent. If the server was legitimately reinstalled, the user "
+                f"removes its line from known_hosts in the gate's working folder")
+    except BaseException:
+        tr.close()
+        raise
+    return tr
+
+
+def run_remote(tr, command, deadline):
+    """Run one command; return (exit code, stdout bytes, stderr bytes). 124 on timeout."""
+    chan = tr.open_session(timeout=SSH_CONNECT_TIMEOUT)
+    out, err = bytearray(), bytearray()
+    try:
+        chan.exec_command(command)
+        while True:
+            got = False
+            while chan.recv_ready():
+                out += chan.recv(65536)
+                got = True
+            while chan.recv_stderr_ready():
+                err += chan.recv_stderr(65536)
+                got = True
+            if got:
+                continue
+            if chan.exit_status_ready() or chan.closed:
+                break
+            if deadline is not None and time.monotonic() > deadline:
+                return 124, bytes(out), bytes(err)
+            time.sleep(0.02)
+        rc = chan.recv_exit_status()
+        return (rc if rc >= 0 else 255), bytes(out), bytes(err)
+    finally:
+        chan.close()
+
+
+def silence_paramiko_logging():
+    """paramiko logs errors with tracebacks; with no handler Python prints them unmasked on stderr."""
+    lg = logging.getLogger("paramiko")
+    if not any(isinstance(h, logging.NullHandler) for h in lg.handlers):
+        lg.addHandler(logging.NullHandler())
+    lg.propagate = False
+
+
+def cmd_ssh(ctx, kp, a):
+    command = list(a.command)
+    if command and command[0] == "--":
+        command = command[1:]
+    if not command:
+        die("no command to run")
+    try:
+        import paramiko
+    except ImportError:
+        die("the SSH library is not installed in the gate's venv (run install.py, see INSTALL.md)")
+    silence_paramiko_logging()
+    srv, cred, names, target, port, expected = resolve_server(kp, a.server, a.cred)
+    masks = secrets_of(cred, [cred.password]) + secrets_of(srv, [])
+    if ctx.cfg["mask_hosts"]:
+        masks = sorted(set(masks) | set(host_masks(names)), key=len, reverse=True)
+    timeout = a.timeout if a.timeout is not None else ctx.cfg["pipe_timeout"]
+    deadline = time.monotonic() + timeout if timeout else None
+    tr = None
+    try:
+        tr = open_transport(ctx, paramiko, srv.title, target, port, expected)
+        try:
+            tr.auth_password(cred.username, cred.password)
+        except paramiko.AuthenticationException:
+            die("authentication failed (check the username and password of the credential entry)")
+        rc, out, err = run_remote(tr, " ".join(command), deadline)
+    except GateError as e:
+        raise GateError(redact(str(e), masks)) from None
+    except Exception as e:      # library errors can quote the host or more: show a masked, short form
+        die(f"ssh to {srv.title!r} failed: {type(e).__name__}: {redact(str(e), masks)[:200]}")
+    finally:
+        if tr is not None:
+            tr.close()
+    out = redact(out.decode("utf-8", "replace"), masks)
+    err = redact(err.decode("utf-8", "replace"), masks)
+    if rc == 124:
+        err += f"\n[gate] killed after {timeout}s"
+    if out:
+        sys.stdout.write(out if out.endswith("\n") else out + "\n")
+    if err:
+        sys.stderr.write(err if err.endswith("\n") else err + "\n")
+    ctx.log("ssh", title=a.server, credential=cred.title, program=os.path.basename(command[0]), rc=rc)
+    return rc
+
+
 def cmd_add(ctx, kp, a):
     title, group = a.title, a.group
     if "/" in title and not group:
@@ -441,6 +771,8 @@ def cmd_add(ctx, kp, a):
 
 
 def cmd_rotate(ctx, kp, a):
+    if a.field != "password":                # "password" is the standard Password field
+        refuse_reserved(a.field)
     e = find(kp, a.title)
     if a.field != "password" and a.field not in (e.custom_properties or {}):
         die(f"no such attribute: {a.field!r}")
@@ -455,6 +787,7 @@ def cmd_rotate(ctx, kp, a):
 
 
 def cmd_gen_attr(ctx, kp, a):
+    refuse_reserved(a.name)
     e = find(kp, a.title)
     if a.name in (e.custom_properties or {}) and not a.overwrite:
         die(f"attribute already exists: {a.name!r} (use --overwrite or rotate)")
@@ -464,6 +797,7 @@ def cmd_gen_attr(ctx, kp, a):
 
 
 def cmd_set_attr(ctx, kp, a):
+    refuse_reserved(a.name)
     e = find(kp, a.title)
     if a.name in (e.custom_properties or {}) and e.is_custom_property_protected(a.name):
         die(f"{a.name!r} is a secret attribute; it cannot be overwritten with a clear value")
@@ -483,12 +817,20 @@ def cmd_set_url(ctx, kp, a):
 
 def cmd_trash(ctx, kp, a):
     e = find(kp, a.title)
+    user = referenced_by_server(kp, e)
+    if user:
+        die(f"{a.title!r} is a credential or jump host of server {user!r} (PASSWORD / JUMP_HOST field); "
+            f"the user removes it in the KeePass app")
     return (lambda: kp.trash_entry(e)), f"moved to Recycle Bin: {a.title}"
 
 
 def run_write(ctx, a, handler):
-    if gui_running() and not a.force_gui:
-        die("a KeePass app is running. Save and close (or lock) the vault there first, then retry; "
+    apps = gui_running()
+    if apps and not a.force_gui and not (ctx.cfg["allow_open_app"] and apps == {"keepassxc"}):
+        die("a KeePass app is running" + ("" if ctx.cfg["allow_open_app"] else " (allow_open_app is off)") +
+            (": only KeePassXC is allowed to stay open, because KeePass 2 may save over the change"
+             if ctx.cfg["allow_open_app"] else "") +
+            ". Save and close (or lock) the vault there first, then retry; "
             "or pass --force-gui if it has no unsaved changes")
     ctx.home.mkdir(parents=True, exist_ok=True)
     with Lock(ctx.home / "vault.lock"):
@@ -570,10 +912,18 @@ def build_parser():
     p.add_argument("--timeout", type=nonneg, default=None, help="seconds, 0 = none (default from config, 300)")
     p.add_argument("title")
     p.add_argument("program", nargs=argparse.REMAINDER, help="program and its arguments")
+
+    p = sub("ssh", "run a command on a server, logging in with the password of its credential entry; "
+                   "output is masked")
+    p.add_argument("--timeout", type=nonneg, default=None, help="seconds, 0 = none (default from config, 300)")
+    p.add_argument("--as", dest="cred", default=None, metavar="CREDENTIAL",
+                   help="which credential of the server to use (default: the first in its PASSWORD list)")
+    p.add_argument("server", help='title or full name of the server entry (fields HOSTNAME, IP, PORT, PASSWORD)')
+    p.add_argument("command", nargs=argparse.REMAINDER, help="the command to run on the server")
     return ap
 
 
-READERS = {"list": cmd_list, "show": cmd_show, "pipe": cmd_pipe}
+READERS = {"list": cmd_list, "show": cmd_show, "pipe": cmd_pipe, "ssh": cmd_ssh}
 WRITERS = {"add": cmd_add, "rotate": cmd_rotate, "gen-attr": cmd_gen_attr, "set-attr": cmd_set_attr,
            "set-user": cmd_set_user, "set-url": cmd_set_url, "trash": cmd_trash}
 

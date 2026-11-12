@@ -4,5 +4,6 @@
   "pipe_allow": ["ssh"],
   "keep_backups": 50,
   "pipe_timeout": 300,
+  "allow_open_app": true,
   "deny": []
 }

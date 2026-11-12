@@ -250,3 +250,17 @@ def test_flat_events_and_exit2_format(sandbox, monkeypatch, capsys):
     assert guard.main(["--format", "exit2"]) == 2
     out = capsys.readouterr()
     assert out.out == "" and "KeePassAI guard" in out.err
+
+
+def test_known_hosts_pins_are_off_limits(sandbox):
+    sb = sandbox
+    kh = sb["work"] / "known_hosts"
+    kh.write_text("", encoding="utf-8")
+    assert run(sb, "Read", file_path=str(kh))
+    assert run(sb, "Write", file_path=str(kh), content="[10.0.0.9]:22 ssh-ed25519 AAAA")
+    assert bash(sb, f'cat "{kh}"')
+    assert bash(sb, "cat ~/.keepassai/known_hosts")
+    assert bash(sb, "echo x >> ~/.keepassai/known_hosts")
+    assert bash(sb, "rm ~/.keepassai/known_hosts")
+    # the gate's ssh command is an ordinary gate call
+    assert bash(sb, f'& "{GATE}/vault.ps1" ssh --as SSH-ALICE TEST-WEB01 -- uptime') is None

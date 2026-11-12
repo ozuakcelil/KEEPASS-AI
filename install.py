@@ -159,7 +159,8 @@ def main():
         else:
             cfg = {"db": str(pathlib.Path(a.db).expanduser().resolve()),
                    "key": str(pathlib.Path(a.key).expanduser().resolve()),
-                   "deny": [], "pipe_allow": ["ssh"], "keep_backups": 50, "pipe_timeout": 300}
+                   "deny": [], "pipe_allow": ["ssh"], "keep_backups": 50, "pipe_timeout": 300,
+                   "allow_open_app": True}
             cfg_path.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
             if os.name != "nt":
                 os.chmod(cfg_path, 0o600)

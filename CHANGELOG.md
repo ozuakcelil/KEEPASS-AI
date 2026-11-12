@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.3.0 - unreleased
+
+- New `ssh` command: run a command on a server with a password from the vault, using
+  `paramiko` (password auth only). Server entries carry `HOSTNAME`, `IP`, `PORT` and
+  `PASSWORD` (one or more credential entries, comma separated; `--as` picks one) fields.
+  Host keys are pinned in `~/.keepassai/known_hosts` on first use; a changed key is refused
+  before any password is sent. Output and errors are masked, including the host name and IP
+  (config `mask_hosts`). `sudo` and jump hosts are not supported yet; a server with
+  `JUMP_HOST` is refused.
+- `set-attr`, `gen-attr` and `rotate --field` refuse the reserved fields `HOSTNAME`, `IP`,
+  `PORT`, `PASSWORD` and `JUMP_HOST`, so the assistant cannot redirect a credential.
+- Optional server field `HOST_KEY` (expected fingerprint, kept in the vault): a match connects
+  without a `known_hosts` line; a mismatch, a malformed value or a disagreement with
+  `known_hosts` is refused. Without it, the first run only pins the key and exits 3 so you can
+  verify the fingerprint; nothing is sent before the key is trusted.
+- Credential references in `PASSWORD` are resolved strictly (exact full name, or a title that
+  matches exactly one live entry; never the Recycle Bin), and `trash` refuses entries that a
+  server uses, so a same-titled entry cannot take over a reference.
+- paramiko log output is silenced (it could print unmasked data); RSA host keys are pinned as
+  `rsa-sha2-*`; a malformed `known_hosts` line or a host with spaces or commas is an error.
+- New config key `allow_open_app` (default true): writing commands run while KeePassXC is open
+  (it merges the change). KeePass 2 running still refuses (`--force-gui` overrides); false
+  restores the old refusal for every app.
+- Saving re-checks the vault's modification time right before replacing it and copies the
+  current file into `backups/` first, so another app's save during the key derivation is not
+  lost silently.
+- `trash` refuses any entry whose full name or title equals an item of a server's `PASSWORD` or
+  `JUMP_HOST` field, even when that item is ambiguous.
+- `requirements.txt` pins all dependencies with hashes (source: `requirements.in`).
+- `show` prints the expiry date; `list` marks entries that are expired or expire within 14 days.
+- The guard keeps `known_hosts` off limits (it lives in the working folder).
+- Requires `paramiko` (pinned in `requirements.txt`): re-run `install.py` after updating.
+
 ## 0.2.0 - 2026-11-08
 
 Security review before the first public release.

@@ -14,7 +14,9 @@ DEFAULTS = {
     "deny": [],           # extra strings the guard denies in shell commands
     "pipe_allow": [],     # if non-empty: the only programs `pipe` may run (basenames, e.g. "ssh")
     "keep_backups": 50,   # how many vault backups to keep (0 = keep all)
-    "pipe_timeout": 300,  # seconds before a `pipe` program is killed
+    "pipe_timeout": 300,  # seconds before a `pipe` or `ssh` command is killed
+    "allow_open_app": True,   # writing commands run while a KeePass app is open (false: refuse unless --force-gui)
+    "mask_hosts": True,   # `ssh` also masks the server's HOSTNAME and IP in its output
 }
 
 
@@ -52,6 +54,9 @@ def _clean(raw) -> dict:
             cfg[k] = [x for x in raw[k] if isinstance(x, str) and x.strip()]
     for k in ("keep_backups", "pipe_timeout"):
         if isinstance(raw.get(k), int) and not isinstance(raw.get(k), bool) and raw[k] >= 0:
+            cfg[k] = raw[k]
+    for k in ("mask_hosts", "allow_open_app"):
+        if isinstance(raw.get(k), bool):
             cfg[k] = raw[k]
     return cfg
 

@@ -39,6 +39,16 @@ your tool's approval step for shell commands.
   The receiving script reads stdin and strips a trailing `\r`. Only programs listed in
   `pipe_allow` are allowed (usually `ssh`). Ask the user to extend the list; never try to echo
   or transform a secret.
+- To run a command on a server: `ssh <server> <command...>` (server entry with `HOSTNAME`, `IP`,
+  `PORT`, `PASSWORD` fields). It logs in with the password from the vault, which you never see.
+  If the server lists several credentials, `--as <credential>` picks one; without it the first
+  is used. `sudo` and jump hosts are not supported yet. Never try to set or change the fields
+  `HOSTNAME`, `IP`, `PORT`, `PASSWORD`, `JUMP_HOST`, `HOST_KEY`: the gate refuses, and the user
+  edits them in the KeePass app. The first `ssh` to a new host only pins its host key and exits
+  with 3, printing the fingerprint: show it to the user, who verifies it (or puts it in the
+  entry's `HOST_KEY` field), then rerun. On a host key mismatch, stop and tell the user; never
+  touch `known_hosts`. `trash` refuses credentials that a server entry uses.
+  `list` and `show` mark expired entries and those that expire soon: tell the user.
 - Writes take a backup automatically. `trash` moves an entry to the Recycle Bin; there is no
   hard delete, and you must never empty the Recycle Bin.
 - If the gate says a KeePass app is running, ask the user to save and lock the vault. Do not

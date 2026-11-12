@@ -126,7 +126,9 @@ Open `~/.keepassai/config.json`:
   "deny": [],
   "pipe_allow": ["ssh"],
   "keep_backups": 50,
-  "pipe_timeout": 300
+  "pipe_timeout": 300,
+  "mask_hosts": true,
+  "allow_open_app": true
 }
 ```
 
